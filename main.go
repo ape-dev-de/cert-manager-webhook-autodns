@@ -92,10 +92,11 @@ type autodnsZoneRecord struct {
 	TTL   int    `json:"ttl"`
 }
 
-// autodnsZoneUpdate is the request body for zone updates.
+// autodnsZoneUpdate is the request body for PATCH /zone/{zone}/{ns}.
 type autodnsZoneUpdate struct {
-	Adds    []autodnsZoneRecord `json:"adds,omitempty"`
-	Removes []autodnsZoneRecord `json:"removes,omitempty"`
+	Origin             string              `json:"origin"`
+	ResourceRecordsAdd []autodnsZoneRecord `json:"resourceRecordsAdd,omitempty"`
+	ResourceRecordsRem []autodnsZoneRecord `json:"resourceRecordsRem,omitempty"`
 }
 
 // autodnsLoginRequest is the JSON body for POST /login.
@@ -132,7 +133,7 @@ func (s *autoDNSSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 		TTL:   60,
 	}
 
-	body := autodnsZoneUpdate{Adds: []autodnsZoneRecord{record}}
+	body := autodnsZoneUpdate{Origin: zone, ResourceRecordsAdd: []autodnsZoneRecord{record}}
 
 	return s.callAPI(cfg, username, password, ctx, zone, body)
 }
@@ -160,7 +161,7 @@ func (s *autoDNSSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 		TTL:   60,
 	}
 
-	body := autodnsZoneUpdate{Removes: []autodnsZoneRecord{record}}
+	body := autodnsZoneUpdate{Origin: zone, ResourceRecordsRem: []autodnsZoneRecord{record}}
 
 	return s.callAPI(cfg, username, password, ctx, zone, body)
 }
