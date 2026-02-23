@@ -6,6 +6,7 @@ certManager:
 
 autodns:
   secretName: autodns-credentials
+  apiThrottleSeconds: 10
 
 image:
   repository: ghcr.io/ape-dev-de/cert-manager-webhook-autodns

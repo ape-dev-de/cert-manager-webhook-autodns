@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"bytes"
 	"crypto/tls"
@@ -23,16 +26,33 @@ import (
 
 var GroupName = os.Getenv("GROUP_NAME")
 
+// apiThrottleDelay is the minimum time between AutoDNS API calls.
+// Configurable via API_THROTTLE_SECONDS env var (default: 10).
+var apiThrottleDelay = func() time.Duration {
+	s := os.Getenv("API_THROTTLE_SECONDS")
+	if s == "" {
+		return 10 * time.Second
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 10 * time.Second
+	}
+	return time.Duration(v) * time.Second
+}()
+
 func main() {
 	if GroupName == "" {
 		panic("GROUP_NAME must be specified")
 	}
+	klog.Infof("Starting AutoDNS webhook solver (throttle: %s)", apiThrottleDelay)
 	cmd.RunWebhookServer(GroupName, &autoDNSSolver{})
 }
 
 // autoDNSSolver implements the webhook.Solver interface.
 type autoDNSSolver struct {
-	client kubernetes.Interface
+	client   kubernetes.Interface
+	mu       sync.Mutex
+	lastCall time.Time
 }
 
 // solverConfig is the configuration decoded from the solver config JSON.
@@ -157,6 +177,18 @@ func (s *autoDNSSolver) getCredentials(cfg solverConfig, namespace string) (stri
 }
 
 func (s *autoDNSSolver) callAPI(cfg solverConfig, username, password, apiCtx, zone string, body autodnsZoneUpdate) error {
+	// Throttle API calls to prevent account lockout
+	s.mu.Lock()
+	if elapsed := time.Since(s.lastCall); elapsed < apiThrottleDelay {
+		wait := apiThrottleDelay - elapsed
+		klog.Infof("AutoDNS throttle: waiting %s before next API call", wait)
+		s.mu.Unlock()
+		time.Sleep(wait)
+		s.mu.Lock()
+	}
+	s.lastCall = time.Now()
+	s.mu.Unlock()
+
 	url := cfg.URL
 	if url == "" {
 		url = "https://api.autodns.com/v1"
