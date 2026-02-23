@@ -8,7 +8,13 @@ Rewritten from [derJD/cert-manager-webhook-autodns](https://github.com/derJD/cer
 
 Handles DNS-01 ACME challenges by creating/removing TXT records via the [AutoDNS API](https://help.internetx.com/display/APIJSONEN). This allows cert-manager to issue certificates (including wildcards) for domains managed by InterNetX/AutoDNS without needing HTTP-01 (no port 80 required).
 
-## Install
+## Prerequisites
+
+- Kubernetes cluster with [cert-manager](https://cert-manager.io/) installed
+- AutoDNS account (InterNetX) with API access
+- Helm 3+ or Flux for deployment
+
+## Quick Start
 
 ### 1. Create the credentials Secret
 
@@ -27,13 +33,27 @@ kubectl -n cert-manager create secret generic autodns-credentials \
 
 ### 2. Deploy the webhook
 
+**One-line install (from GitHub):**
+
 ```bash
 helm install cert-manager-webhook-autodns \
   --namespace cert-manager \
-  deploy/cert-manager-webhook-autodns
+  oci://ghcr.io/ape-dev-de/charts/cert-manager-webhook-autodns \
+  --version v1.0.0
 ```
 
-Or with Flux HelmRelease pointing to this repo's Helm chart.
+**Or from a git clone:**
+
+```bash
+git clone https://github.com/ape-dev-de/cert-manager-webhook-autodns.git
+helm install cert-manager-webhook-autodns \
+  --namespace cert-manager \
+  cert-manager-webhook-autodns/deploy/cert-manager-webhook-autodns
+```
+
+**Or with Flux (GitOps):**
+
+See [Flux / GitOps Deployment](#flux--gitops-deployment) below.
 
 ### 3. Create a ClusterIssuer
 
@@ -79,6 +99,80 @@ spec:
     - "*.example.com"
 ```
 
+## Flux / GitOps Deployment
+
+For Flux-managed clusters, add these resources to your GitOps repository:
+
+**1. HelmRepository (OCI):**
+
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: cert-manager-webhook-autodns
+  namespace: cert-manager
+spec:
+  type: oci
+  interval: 1h
+  url: oci://ghcr.io/ape-dev-de/charts
+```
+
+**2. HelmRelease:**
+
+```yaml
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: cert-manager-webhook-autodns
+  namespace: cert-manager
+spec:
+  interval: 1h
+  chart:
+    spec:
+      chart: cert-manager-webhook-autodns
+      version: "1.0.0"
+      sourceRef:
+        kind: HelmRepository
+        name: cert-manager-webhook-autodns
+  values:
+    groupName: acme.ape-dev.de
+    image:
+      tag: v1.0.0
+```
+
+**Alternative — Flux GitRepository (pull chart from source):**
+
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: cert-manager-webhook-autodns
+  namespace: cert-manager
+spec:
+  interval: 1h
+  url: https://github.com/ape-dev-de/cert-manager-webhook-autodns
+  ref:
+    tag: v1.0.0
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: cert-manager-webhook-autodns
+  namespace: cert-manager
+spec:
+  interval: 1h
+  chart:
+    spec:
+      chart: deploy/cert-manager-webhook-autodns
+      sourceRef:
+        kind: GitRepository
+        name: cert-manager-webhook-autodns
+  values:
+    groupName: acme.ape-dev.de
+    image:
+      tag: v1.0.0
+```
+
 ## Configuration
 
 ### Solver config fields
@@ -93,14 +187,14 @@ spec:
 
 ### Helm values
 
-| Value                          | Default                                                      |
-|--------------------------------|--------------------------------------------------------------|
-| `groupName`                    | `acme.ape-dev.de`                                            |
-| `certManager.namespace`        | `cert-manager`                                               |
-| `certManager.serviceAccountName` | `cert-manager`                                             |
-| `autodns.secretName`           | `autodns-credentials`                                        |
-| `image.repository`             | `ghcr.io/ape-dev-de/cert-manager-webhook-autodns`            |
-| `image.tag`                    | `v1.0.0`                                                     |
+| Value                            | Default                                                   |
+|----------------------------------|-----------------------------------------------------------|
+| `groupName`                      | `acme.ape-dev.de`                                         |
+| `certManager.namespace`          | `cert-manager`                                            |
+| `certManager.serviceAccountName` | `cert-manager`                                            |
+| `autodns.secretName`             | `autodns-credentials`                                     |
+| `image.repository`               | `ghcr.io/ape-dev-de/cert-manager-webhook-autodns`         |
+| `image.tag`                      | `v1.0.0`                                                  |
 
 ## How it works
 
@@ -117,7 +211,7 @@ Authentication uses HTTP Basic Auth with `X-Domainrobot-Context` header, credent
 - RBAC scoped to single named Secret (no cluster-wide secrets access)
 - Container runs as non-root (UID 65534) with read-only root filesystem
 - No privileged capabilities
-- Image built from source via GitHub Actions (auditable supply chain)
+- Image built from source via GitHub Actions ([auditable supply chain](.github/workflows/release.yaml))
 
 ## Development
 
