@@ -24,6 +24,8 @@ import (
 	"k8s.io/klog/v2"
 )
 
+const userAgent = "cert-manager-webhook-autodns/1.0"
+
 var GroupName = os.Getenv("GROUP_NAME")
 
 // apiThrottleDelay is the minimum time between AutoDNS API calls.
@@ -40,19 +42,37 @@ var apiThrottleDelay = func() time.Duration {
 	return time.Duration(v) * time.Second
 }()
 
+// authLockoutDuration is how long to block API calls after an auth failure.
+// Configurable via AUTH_LOCKOUT_MINUTES env var (default: 65).
+var authLockoutDuration = func() time.Duration {
+	s := os.Getenv("AUTH_LOCKOUT_MINUTES")
+	if s == "" {
+		return 65 * time.Minute
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 65 * time.Minute
+	}
+	return time.Duration(v) * time.Minute
+}()
+
 func main() {
 	if GroupName == "" {
 		panic("GROUP_NAME must be specified")
 	}
-	klog.Infof("Starting AutoDNS webhook solver (throttle: %s)", apiThrottleDelay)
+	klog.Infof("Starting AutoDNS webhook solver (throttle: %s, auth_lockout: %s)", apiThrottleDelay, authLockoutDuration)
 	cmd.RunWebhookServer(GroupName, &autoDNSSolver{})
 }
 
 // autoDNSSolver implements the webhook.Solver interface.
 type autoDNSSolver struct {
-	client   kubernetes.Interface
-	mu       sync.Mutex
-	lastCall time.Time
+	client        kubernetes.Interface
+	mu            sync.Mutex
+	lastCall      time.Time
+	sessionID     string
+	sessionExpiry time.Time
+	authLockedAt  time.Time
+	authLastError string
 }
 
 // solverConfig is the configuration decoded from the solver config JSON.
@@ -76,6 +96,13 @@ type autodnsZoneRecord struct {
 type autodnsZoneUpdate struct {
 	Adds    []autodnsZoneRecord `json:"adds,omitempty"`
 	Removes []autodnsZoneRecord `json:"removes,omitempty"`
+}
+
+// autodnsLoginRequest is the JSON body for POST /login.
+type autodnsLoginRequest struct {
+	Context  string `json:"context"`
+	User     string `json:"user"`
+	Password string `json:"password"`
 }
 
 func (s *autoDNSSolver) Name() string {
@@ -176,9 +203,100 @@ func (s *autoDNSSolver) getCredentials(cfg solverConfig, namespace string) (stri
 	return username, password, apiCtx, nil
 }
 
+// isAuthError returns true for HTTP status codes that indicate authentication failure.
+func isAuthError(statusCode int) bool {
+	return statusCode == 401 || statusCode == 403
+}
+
+func (s *autoDNSSolver) httpClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+		},
+	}
+}
+
+// login creates a session via POST /login and stores the session ID.
+func (s *autoDNSSolver) login(baseURL, username, password, apiCtx string) error {
+	loginBody := autodnsLoginRequest{
+		Context:  apiCtx,
+		User:     username,
+		Password: password,
+	}
+
+	jsonBody, err := json.Marshal(loginBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal login request: %v", err)
+	}
+
+	endpoint := fmt.Sprintf("%s/login?timeout=55", baseURL)
+	klog.Infof("AutoDNS login: POST %s", endpoint)
+
+	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return fmt.Errorf("failed to create login request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Domainrobot-Context", apiCtx)
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := s.httpClient().Do(req)
+	if err != nil {
+		return fmt.Errorf("login request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errMsg := fmt.Sprintf("AutoDNS login failed: status=%d body=%s", resp.StatusCode, string(respBody))
+		if isAuthError(resp.StatusCode) {
+			s.authLockedAt = time.Now()
+			s.authLastError = errMsg
+			klog.Errorf("AutoDNS auth FAILED (status %d) — circuit breaker activated for %s. Check credentials in secret, then restart pod.", resp.StatusCode, authLockoutDuration)
+		}
+		return fmt.Errorf("%s", errMsg)
+	}
+
+	sessionID := resp.Header.Get("X-Domainrobot-SessionId")
+	if sessionID == "" {
+		return fmt.Errorf("login succeeded but no X-Domainrobot-SessionId in response")
+	}
+
+	s.sessionID = sessionID
+	s.sessionExpiry = time.Now().Add(50 * time.Minute) // 55min timeout with 5min buffer
+	klog.Infof("AutoDNS login success, session valid until %s", s.sessionExpiry.Format(time.RFC3339))
+	return nil
+}
+
+// ensureSession logs in if there is no valid session.
+func (s *autoDNSSolver) ensureSession(baseURL, username, password, apiCtx string) error {
+	if s.sessionID != "" && time.Now().Before(s.sessionExpiry) {
+		return nil
+	}
+	klog.Infof("AutoDNS session expired or missing, logging in...")
+	return s.login(baseURL, username, password, apiCtx)
+}
+
 func (s *autoDNSSolver) callAPI(cfg solverConfig, username, password, apiCtx, zone string, body autodnsZoneUpdate) error {
-	// Throttle API calls to prevent account lockout
 	s.mu.Lock()
+
+	// Circuit breaker: refuse to call API if auth is locked out
+	if !s.authLockedAt.IsZero() {
+		remaining := authLockoutDuration - time.Since(s.authLockedAt)
+		if remaining > 0 {
+			s.mu.Unlock()
+			klog.Errorf("AutoDNS auth circuit breaker OPEN — blocking API call for %s (last error: %s)", remaining.Round(time.Second), s.authLastError)
+			return fmt.Errorf("AutoDNS auth locked out for %s after auth failure — check credentials in secret, then restart pod. Last error: %s", remaining.Round(time.Second), s.authLastError)
+		}
+		// Lockout expired, reset
+		klog.Infof("AutoDNS auth lockout expired, allowing API calls again")
+		s.authLockedAt = time.Time{}
+		s.authLastError = ""
+	}
+
+	// Throttle API calls
 	if elapsed := time.Since(s.lastCall); elapsed < apiThrottleDelay {
 		wait := apiThrottleDelay - elapsed
 		klog.Infof("AutoDNS throttle: waiting %s before next API call", wait)
@@ -187,19 +305,27 @@ func (s *autoDNSSolver) callAPI(cfg solverConfig, username, password, apiCtx, zo
 		s.mu.Lock()
 	}
 	s.lastCall = time.Now()
-	s.mu.Unlock()
 
-	url := cfg.URL
-	if url == "" {
-		url = "https://api.autodns.com/v1"
+	baseURL := cfg.URL
+	if baseURL == "" {
+		baseURL = "https://api.autodns.com/v1"
 	}
+
+	// Ensure we have a valid session
+	if err := s.ensureSession(baseURL, username, password, apiCtx); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+
+	sessionID := s.sessionID
+	s.mu.Unlock()
 
 	nameServer := cfg.NameServer
 	if nameServer == "" {
 		nameServer = "a.ns14.net" // InterNetX default
 	}
 
-	endpoint := fmt.Sprintf("%s/zone/%s/%s", url, zone, nameServer)
+	endpoint := fmt.Sprintf("%s/zone/%s/%s", baseURL, zone, nameServer)
 
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
@@ -213,17 +339,12 @@ func (s *autoDNSSolver) callAPI(cfg solverConfig, username, password, apiCtx, zo
 		return fmt.Errorf("failed to create request: %v", err)
 	}
 
-	req.SetBasicAuth(username, password)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Domainrobot-Context", apiCtx)
+	req.Header.Set("X-Domainrobot-SessionId", sessionID)
+	req.Header.Set("User-Agent", userAgent)
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
-		},
-	}
-
-	resp, err := client.Do(req)
+	resp, err := s.httpClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("API request failed: %v", err)
 	}
@@ -232,7 +353,19 @@ func (s *autoDNSSolver) callAPI(cfg solverConfig, username, password, apiCtx, zo
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("AutoDNS API error: status=%d body=%s", resp.StatusCode, string(respBody))
+		errMsg := fmt.Sprintf("AutoDNS API error: status=%d body=%s", resp.StatusCode, string(respBody))
+
+		// On auth errors, invalidate session and activate circuit breaker
+		if isAuthError(resp.StatusCode) {
+			s.mu.Lock()
+			s.sessionID = ""
+			s.authLockedAt = time.Now()
+			s.authLastError = errMsg
+			s.mu.Unlock()
+			klog.Errorf("AutoDNS auth FAILED (status %d) — circuit breaker activated for %s. Check credentials in secret, then restart pod.", resp.StatusCode, authLockoutDuration)
+		}
+
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	klog.Infof("AutoDNS API success: %s %d", endpoint, resp.StatusCode)
