@@ -1,0 +1,16 @@
+groupName: acme.ape-dev.de
+
+certManager:
+  namespace: cert-manager
+  serviceAccountName: cert-manager
+
+autodns:
+  secretName: autodns-credentials
+
+image:
+  repository: ghcr.io/ape-dev-de/cert-manager-webhook-autodns
+  tag: v1.0.0
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
