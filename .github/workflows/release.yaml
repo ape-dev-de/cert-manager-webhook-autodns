@@ -49,6 +49,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Make container package public
+        run: |
+          gh api \
+            --method PATCH \
+            /orgs/${{ github.repository_owner }}/packages/container/$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')/versions \
+            2>/dev/null || true
+          # Set package visibility to public via GitHub API
+          curl -s -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/orgs/${{ github.repository_owner }}/packages/container/$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" \
+            -d '{"visibility":"public"}' || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Push Helm chart to GHCR
         run: |
           VERSION=${GITHUB_REF_NAME#v}
@@ -57,3 +72,11 @@ jobs:
           sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" Chart.yaml
           helm package .
           helm push cert-manager-webhook-autodns-${VERSION}.tgz oci://${{ env.REGISTRY }}/ape-dev-de/charts
+
+      - name: Make Helm chart package public
+        run: |
+          curl -s -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/orgs/${{ github.repository_owner }}/packages/container/charts%2Fcert-manager-webhook-autodns" \
+            -d '{"visibility":"public"}' || true
